@@ -11,9 +11,10 @@
 set -e
 
 # === Konfiguration ===
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/install-zabbix-proxy_$(date +%Y%m%d_%H%M%S).log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || true
+# Fester Log-Pfad, damit Logs immer auffindbar sind (unabhängig von Aufrufpfad/sudo)
+LOG_DIR="/var/log/zabbix-proxy-install"
+LOG_FILE=""
 ZABBIX_VERSIONS=("7.0" "6.0" "5.0")
 DB_NAME="zabbix_proxy"
 PROXY_CONF="/etc/zabbix/zabbix_proxy.conf"
@@ -114,10 +115,29 @@ ask_zabbix_server() {
     log "Zabbix Server: ${ZABBIX_SERVER}"
 }
 
+ask_hostname() {
+    echo ""
+    read -rp "Proxy/Hostname für Zabbix [$(hostname)]: " PROXY_HOSTNAME
+    PROXY_HOSTNAME="${PROXY_HOSTNAME:-$(hostname)}"
+    log "Proxy Hostname: ${PROXY_HOSTNAME}"
+}
+
+# Erlaubt nur Zeichen für PostgreSQL-Benutzernamen (Buchstaben, Zahlen, Unterstrich)
+validate_db_user() {
+    if [[ ! "${DB_USER}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        echo "Ungültiger PostgreSQL-Benutzername. Nur Buchstaben, Zahlen und Unterstrich erlaubt."
+        return 1
+    fi
+    return 0
+}
+
 ask_db_credentials() {
     echo ""
     read -rp "PostgreSQL Benutzername [${RUN_AS_USER}]: " DB_USER
     DB_USER="${DB_USER:-${RUN_AS_USER}}"
+    while ! validate_db_user; do
+        read -rp "PostgreSQL Benutzername erneut eingeben: " DB_USER
+    done
 
     read -rsp "PostgreSQL Kennwort: " DB_PASSWORD
     echo ""
@@ -189,21 +209,28 @@ install_postgresql() {
         fi
     fi
 
-    # PostgreSQL Service starten
+    # PostgreSQL Service aktivieren (reboot-sicher) und starten
     local pg_service="postgresql"
     if systemctl list-units --type=service | grep -q postgresql-; then
         pg_service=$(systemctl list-units --type=service --no-legend | grep postgresql | head -1 | awk '{print $1}')
     fi
     systemctl enable "${pg_service}"
     systemctl start "${pg_service}"
-    log "PostgreSQL gestartet"
+    log "PostgreSQL enabled und gestartet (startet nach Reboot automatisch)."
 }
 
 # === PostgreSQL User und DB anlegen ===
+# Kennwort für SQL escapen: einzelnes ' durch '' ersetzen (SQL-Injection verhindern)
+escape_password_for_sql() {
+    echo -n "$1" | sed "s/'/''/g"
+}
+
 setup_postgresql_db() {
     log "Lege PostgreSQL User und Datenbank an..."
+    local escaped_pass
+    escaped_pass=$(escape_password_for_sql "${DB_PASSWORD}")
     sudo -u postgres createuser "${DB_USER}" 2>/dev/null || true
-    sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" WITH PASSWORD '${DB_PASSWORD}';" 2>/dev/null || true
+    sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" WITH PASSWORD '${escaped_pass}';" 2>/dev/null || true
     sudo -u postgres createdb -O "${DB_USER}" "${DB_NAME}" 2>/dev/null || true
     log "Datenbank ${DB_NAME} angelegt"
 }
@@ -241,16 +268,22 @@ import_schema() {
         log "Fehler: proxy.sql nicht gefunden!"
         exit 1
     fi
+    unset PGPASSWORD
     log "Schema importiert"
 }
 
-# === Config-Parameter setzen (sed-safe) ===
+# === Config-Parameter setzen (sed-safe, Injection-sicher) ===
+# Escaped für sed mit # als Delimiter: \ & / # ; Zeilenumbrüche werden entfernt
+escape_config_value() {
+    printf '%s' "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/&/\\&/g; s/#/\\#/g; s/\//\\\//g'
+}
+
 set_config_param() {
     local file="$1"
     local param="$2"
     local value="$3"
     local escaped_value
-    escaped_value=$(echo "${value}" | sed 's/[\/&]/\\&/g')
+    escaped_value=$(escape_config_value "${value}")
 
     if grep -q "^${param}=" "${file}" 2>/dev/null; then
         sed -i "s#^${param}=.*#${param}=${escaped_value}#" "${file}"
@@ -261,13 +294,56 @@ set_config_param() {
     fi
 }
 
+# === Config-Datei anlegen falls vom Paket nicht mitgeliefert ===
+ensure_proxy_config() {
+    if [[ -f "${PROXY_CONF}" ]]; then
+        [[ -f "${PROXY_CONF}.bak" ]] || cp "${PROXY_CONF}" "${PROXY_CONF}.bak"
+        return
+    fi
+    log "Proxy-Config nicht gefunden, lege neue an: ${PROXY_CONF}"
+    mkdir -p "$(dirname "${PROXY_CONF}")"
+    # Minimal-Konfiguration (set_config_param ergänzt die Werte)
+    cat > "${PROXY_CONF}" << 'PROXYCONF'
+# Zabbix Proxy - minimal (Script-generiert)
+Server=
+Hostname=
+DBName=zabbix_proxy
+DBUser=
+DBPassword=
+LogFile=/var/log/zabbix/zabbix_proxy.log
+PidFile=/run/zabbix/zabbix_proxy.pid
+SocketDir=/run/zabbix
+ListenPort=10051
+PROXYCONF
+    chmod 640 "${PROXY_CONF}"
+}
+
+ensure_agent2_config() {
+    if [[ -f "${AGENT2_CONF}" ]]; then
+        [[ -f "${AGENT2_CONF}.bak" ]] || cp "${AGENT2_CONF}" "${AGENT2_CONF}.bak"
+        return
+    fi
+    log "Agent2-Config nicht gefunden, lege neue an: ${AGENT2_CONF}"
+    mkdir -p "$(dirname "${AGENT2_CONF}")"
+    cat > "${AGENT2_CONF}" << 'AGENT2CONF'
+# Zabbix Agent 2 - minimal (Script-generiert)
+Server=127.0.0.1
+ServerActive=127.0.0.1:10051
+Hostname=
+LogFile=/var/log/zabbix/zabbix_agent2.log
+PidFile=/run/zabbix/zabbix_agent2.pid
+SocketDir=/run/zabbix
+AGENT2CONF
+    chmod 640 "${AGENT2_CONF}"
+}
+
 # === Proxy konfigurieren ===
 configure_proxy() {
     log "Konfiguriere Zabbix Proxy..."
-    [[ -f "${PROXY_CONF}.bak" ]] || cp "${PROXY_CONF}" "${PROXY_CONF}.bak"
+    ensure_proxy_config
 
     set_config_param "${PROXY_CONF}" "Server" "${ZABBIX_SERVER}"
-    set_config_param "${PROXY_CONF}" "Hostname" "$(hostname)"
+    set_config_param "${PROXY_CONF}" "Hostname" "${PROXY_HOSTNAME}"
     set_config_param "${PROXY_CONF}" "DBName" "${DB_NAME}"
     set_config_param "${PROXY_CONF}" "DBUser" "${DB_USER}"
     set_config_param "${PROXY_CONF}" "DBPassword" "${DB_PASSWORD}"
@@ -285,11 +361,11 @@ configure_proxy() {
 # === Agent 2 konfigurieren ===
 configure_agent2() {
     log "Konfiguriere Zabbix Agent 2..."
-    [[ -f "${AGENT2_CONF}.bak" ]] || cp "${AGENT2_CONF}" "${AGENT2_CONF}.bak"
+    ensure_agent2_config
 
     set_config_param "${AGENT2_CONF}" "Server" "127.0.0.1"
     set_config_param "${AGENT2_CONF}" "ServerActive" "127.0.0.1:10051"
-    set_config_param "${AGENT2_CONF}" "Hostname" "$(hostname)"
+    set_config_param "${AGENT2_CONF}" "Hostname" "${PROXY_HOSTNAME}"
 
     if [[ "${USE_PSK}" == "yes" ]]; then
         echo "${PSK_KEY}" > "${AGENT2_PSK}"
@@ -302,20 +378,26 @@ configure_agent2() {
     fi
 }
 
-# === Services starten ===
+# === Services aktivieren und starten (reboot-sicher) ===
 start_services() {
-    log "Starte Services..."
+    log "Aktiviere Services für Autostart nach Reboot..."
     local pg_service="postgresql"
     if systemctl list-units --type=service 2>/dev/null | grep -q postgresql-; then
         pg_service=$(systemctl list-units --type=service --no-legend 2>/dev/null | grep postgresql | head -1 | awk '{print $1}' || echo "postgresql")
     fi
 
-    systemctl enable "${pg_service}" zabbix-proxy zabbix-agent2
+    systemctl enable "${pg_service}"
+    systemctl enable zabbix-proxy
+    systemctl enable zabbix-agent2
+    log "Services sind enabled (starten nach Reboot automatisch)."
+
+    log "Starte Services..."
+    systemctl restart "${pg_service}"
     systemctl restart zabbix-proxy zabbix-agent2
 
     sleep 2
     if systemctl is-active --quiet zabbix-proxy && systemctl is-active --quiet zabbix-agent2; then
-        log "Zabbix Proxy und Agent 2 laufen erfolgreich."
+        log "Zabbix Proxy und Agent 2 laufen erfolgreich (reboot-sicher)."
     else
         log "Warnung: Bitte Service-Status prüfen: systemctl status zabbix-proxy zabbix-agent2"
     fi
@@ -323,11 +405,26 @@ start_services() {
 
 # === Hauptablauf ===
 main() {
+    # Zuerst Privilegien prüfen (ggf. sudo), damit Log-Verzeichnis als root angelegt werden kann
+    check_privileges "$@"
+
+    # Log-Pfad setzen und Verzeichnis anlegen (fester Pfad, reboot-persistent)
+    LOG_FILE="${LOG_DIR}/install-zabbix-proxy_$(date +%Y%m%d_%H%M%S).log"
     mkdir -p "${LOG_DIR}"
+    if ! touch "${LOG_FILE}" 2>/dev/null; then
+        LOG_DIR="/tmp/zabbix-proxy-install"
+        mkdir -p "${LOG_DIR}"
+        LOG_FILE="${LOG_DIR}/install-zabbix-proxy_$(date +%Y%m%d_%H%M%S).log"
+        touch "${LOG_FILE}" || { echo "Fehler: Log-Datei konnte nicht angelegt werden."; exit 1; }
+    fi
+    # Erste Zeile direkt in Datei schreiben, damit die Datei garantiert existiert
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log gestartet: ${LOG_FILE}" >> "${LOG_FILE}"
+    # Pfad auf Konsole ausgeben (vor exec), falls Terminal von tee getrennt ist
+    echo "Log-Datei: ${LOG_FILE}" >&2
     exec > >(tee -a "${LOG_FILE}") 2>&1
 
     log "=== Zabbix Proxy Installation gestartet ==="
-    check_privileges "$@"
+    log "Log-Datei: ${LOG_FILE}"
     detect_platform
     install_deps
 
@@ -335,6 +432,7 @@ main() {
     add_zabbix_repo
 
     ask_zabbix_server
+    ask_hostname
     ask_db_credentials
     ask_psk
 

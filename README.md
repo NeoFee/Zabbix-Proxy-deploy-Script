@@ -38,7 +38,7 @@ Das Script führt interaktiv durch:
 
 ## Log-Datei
 
-Die Installation wird in `logs/install-zabbix-proxy_YYYYMMDD_HHMMSS.log` protokolliert. Keine Passwörter oder PSK-Keys werden geloggt.
+Die Installation wird in **`/var/log/zabbix-proxy-install/install-zabbix-proxy_YYYYMMDD_HHMMSS.log`** protokolliert. Falls das Script dort nicht schreiben kann, wird `/tmp/zabbix-proxy-install/` verwendet. Keine Passwörter oder PSK-Keys werden geloggt.
 
 ## Nach der Installation
 
