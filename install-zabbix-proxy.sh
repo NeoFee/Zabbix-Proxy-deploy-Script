@@ -54,7 +54,12 @@ check_privileges() {
     fi
     # Beim Ausführen mit sudo: SUDO_USER = der eingeloggte User (für DB-User-Voreinstellung)
     RUN_AS_USER="${SUDO_USER:-$USER}"
-    log "Privilegierte Befehle als root, Datenbank-User = ${RUN_AS_USER}"
+    # Default-DB-User: eingeloggter User; bei direktem Root-Login besser zabbix_proxy als "root"
+    DEFAULT_DB_USER="${RUN_AS_USER}"
+    if [[ "${RUN_AS_USER}" == "root" ]]; then
+        DEFAULT_DB_USER="zabbix_proxy"
+    fi
+    log "Privilegierte Befehle als root, Datenbank-User (Voreinstellung) = ${DEFAULT_DB_USER}"
 }
 
 # === Plattform-Erkennung ===
@@ -188,8 +193,8 @@ validate_db_user() {
 
 ask_db_credentials() {
     echo ""
-    read -rp "PostgreSQL Benutzername [${RUN_AS_USER}]: " DB_USER
-    DB_USER="${DB_USER:-${RUN_AS_USER}}"
+    read -rp "PostgreSQL Benutzername [${DEFAULT_DB_USER}]: " DB_USER
+    DB_USER="${DB_USER:-${DEFAULT_DB_USER}}"
     while ! validate_db_user; do
         read -rp "PostgreSQL Benutzername erneut eingeben: " DB_USER
     done
@@ -296,8 +301,15 @@ setup_postgresql_db() {
     local escaped_pass
     escaped_pass=$(escape_password_for_sql "${DB_PASSWORD}")
     sudo -u postgres createuser "${DB_USER}" 2>/dev/null || true
-    sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" WITH PASSWORD '${escaped_pass}';" 2>/dev/null || true
+    if ! sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" WITH PASSWORD '${escaped_pass}';"; then
+        log "Fehler: Passwort für PostgreSQL-User ${DB_USER} konnte nicht gesetzt werden."
+        exit 1
+    fi
     sudo -u postgres createdb -O "${DB_USER}" "${DB_NAME}" 2>/dev/null || true
+    if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "${DB_NAME}"; then
+        log "Fehler: Datenbank ${DB_NAME} konnte nicht angelegt werden."
+        exit 1
+    fi
     log "Datenbank ${DB_NAME} angelegt"
 }
 
