@@ -232,6 +232,11 @@ ask_psk() {
 install_deps() {
     log "Installiere Abhängigkeiten..."
     if [[ "${PLATFORM}" == "debian" ]]; then
+        # Altes Zabbix-Repo entfernen, damit apt-get update nicht an falscher ubuntu/debian-Liste scheitert
+        if [[ -f /etc/apt/sources.list.d/zabbix.list ]]; then
+            rm -f /etc/apt/sources.list.d/zabbix.list
+            log "Alte Zabbix-Repo-Datei entfernt (wird in add_zabbix_repo neu angelegt)."
+        fi
         apt-get update -qq
         apt-get install -y -qq curl gnupg ca-certificates
     else
