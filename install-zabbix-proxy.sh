@@ -1,7 +1,18 @@
 #!/bin/bash
 #
 # Zabbix Proxy Installations-Script
-# Installiert Zabbix Proxy mit PostgreSQL und Zabbix Agent 2 auf Ubuntu/Debian und RHEL/Rocky/AlmaLinux
+# Installiert Zabbix Proxy mit PostgreSQL und Zabbix Agent 2.
+#
+# Unterstützte Distributionen (Repo wird anhand OS-Erkennung gewählt):
+#   APT (PLATFORM=debian):
+#     - Ubuntu 20.04/22.04/24.04/24.10/25.04+  → Repo: repo.zabbix.com/.../ubuntu (Codename: focal/jammy/noble/...)
+#     - Debian 11/12+                           → Repo: repo.zabbix.com/.../debian (Codename: bullseye/bookworm/...)
+#   RPM (PLATFORM=rhel):
+#     - RHEL 8, 9                               → Repo: repo.zabbix.com/.../rhel/8|9
+#     - CentOS 8, 9                             → Repo: repo.zabbix.com/.../centos/8|9
+#     - Rocky Linux 8, 9                        → Repo: repo.zabbix.com/.../rocky/8|9
+#     - AlmaLinux 8, 9                          → Repo: repo.zabbix.com/.../alma/8|9
+#     - Oracle Linux 8, 9                       → Repo: repo.zabbix.com/.../oracle/8|9
 #
 # Läuft als eingeloggter User (fordert sudo bei Bedarf an).
 # Es wird kein separater Zabbix-Systemuser angelegt – nur der PostgreSQL-Datenbankuser.
@@ -47,6 +58,7 @@ check_privileges() {
 }
 
 # === Plattform-Erkennung ===
+# Setzt PLATFORM (debian|rhel), REPO_DISTRO (ubuntu|debian|rhel|rocky|alma) und ggf. CODENAME / RHEL_MAJOR
 detect_platform() {
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
@@ -61,6 +73,7 @@ detect_platform() {
                [[ "${VERSION_ID}" == "25.04" ]] || [[ "${VERSION_ID}" =~ ^2[5-9]\. ]] || \
                [[ "${VERSION_ID}" == "22.04" ]] || [[ "${VERSION_ID}" == "20.04" ]]; then
                 PLATFORM="debian"
+                REPO_DISTRO="ubuntu"
                 CODENAME="${VERSION_CODENAME:-noble}"
             else
                 log "Fehler: Ubuntu ${VERSION_ID} wird nicht unterstützt. Bitte Ubuntu 24.04 LTS oder neuer verwenden."
@@ -70,18 +83,60 @@ detect_platform() {
         debian)
             if [[ "${VERSION_ID}" == "11" ]] || [[ "${VERSION_ID}" == "12" ]] || [[ "${VERSION_ID}" =~ ^1[2-9]$ ]]; then
                 PLATFORM="debian"
+                REPO_DISTRO="debian"
                 CODENAME="${VERSION_CODENAME:-bookworm}"
             else
                 log "Fehler: Debian ${VERSION_ID} wird nicht unterstützt."
                 exit 1
             fi
             ;;
-        rhel|rocky|almalinux)
+        rhel)
             if [[ "${VERSION_ID}" == "8" ]] || [[ "${VERSION_ID}" == "9" ]] || [[ "${VERSION_ID}" =~ ^[89]\. ]]; then
                 PLATFORM="rhel"
+                REPO_DISTRO="rhel"
                 RHEL_MAJOR="${VERSION_ID%%.*}"
             else
-                log "Fehler: ${ID} ${VERSION_ID} wird nicht unterstützt."
+                log "Fehler: RHEL ${VERSION_ID} wird nicht unterstützt."
+                exit 1
+            fi
+            ;;
+        centos)
+            if [[ "${VERSION_ID}" == "8" ]] || [[ "${VERSION_ID}" == "9" ]] || [[ "${VERSION_ID}" =~ ^[89]\. ]]; then
+                PLATFORM="rhel"
+                REPO_DISTRO="centos"
+                RHEL_MAJOR="${VERSION_ID%%.*}"
+            else
+                log "Fehler: CentOS ${VERSION_ID} wird nicht unterstützt."
+                exit 1
+            fi
+            ;;
+        rocky)
+            if [[ "${VERSION_ID}" == "8" ]] || [[ "${VERSION_ID}" == "9" ]] || [[ "${VERSION_ID}" =~ ^[89]\. ]]; then
+                PLATFORM="rhel"
+                REPO_DISTRO="rocky"
+                RHEL_MAJOR="${VERSION_ID%%.*}"
+            else
+                log "Fehler: Rocky Linux ${VERSION_ID} wird nicht unterstützt."
+                exit 1
+            fi
+            ;;
+        almalinux)
+            if [[ "${VERSION_ID}" == "8" ]] || [[ "${VERSION_ID}" == "9" ]] || [[ "${VERSION_ID}" =~ ^[89]\. ]]; then
+                PLATFORM="rhel"
+                REPO_DISTRO="alma"
+                RHEL_MAJOR="${VERSION_ID%%.*}"
+            else
+                log "Fehler: AlmaLinux ${VERSION_ID} wird nicht unterstützt."
+                exit 1
+            fi
+            ;;
+        ol|oracle)  # Oracle Linux
+            if [[ "${VERSION_ID}" == "8" ]] || [[ "${VERSION_ID}" == "9" ]] || [[ "${VERSION_ID}" =~ ^[89]\. ]]; then
+                PLATFORM="rhel"
+                REPO_DISTRO="oracle"
+                RHEL_MAJOR="${VERSION_ID%%.*}"
+            else
+                log "Fehler: Oracle Linux ${VERSION_ID} wird nicht unterstützt."
                 exit 1
             fi
             ;;
@@ -90,7 +145,7 @@ detect_platform() {
             exit 1
             ;;
     esac
-    log "Plattform erkannt: ${ID} ${VERSION_ID} (${PLATFORM})"
+    log "Plattform erkannt: ${ID} ${VERSION_ID} (${PLATFORM}, Repo: ${REPO_DISTRO})"
 }
 
 # === Interaktive Abfragen ===
@@ -185,14 +240,20 @@ install_deps() {
 }
 
 # === Zabbix Repo hinzufügen ===
+# Repos je nach REPO_DISTRO (ubuntu, debian, rhel, rocky, alma, oracle)
 add_zabbix_repo() {
-    log "Füge Zabbix Repository hinzu..."
+    log "Füge Zabbix Repository hinzu (${REPO_DISTRO})..."
     if [[ "${PLATFORM}" == "debian" ]]; then
+        # Debian/Ubuntu: Repo-Pfad = ubuntu oder debian, Codename aus os-release
         curl -fsSL "https://repo.zabbix.com/zabbix-official-repo.key" | gpg --dearmor -o /usr/share/keyrings/zabbix-archive-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/zabbix-archive-keyring.gpg] https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/ubuntu ${CODENAME} main" > /etc/apt/sources.list.d/zabbix.list
+        echo "deb [signed-by=/usr/share/keyrings/zabbix-archive-keyring.gpg] https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/${REPO_DISTRO} ${CODENAME} main" > /etc/apt/sources.list.d/zabbix.list
         apt-get update -qq
     else
-        rpm -Uvh "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/rhel/${RHEL_MAJOR}/x86_64/zabbix-release-${ZABBIX_VERSION}-3.el${RHEL_MAJOR}.noarch.rpm" 2>/dev/null || true
+        # RHEL/Rocky/Alma/Oracle: je nach REPO_DISTRO eigenes Repo
+        # Paketname: zabbix-release-${ZABBIX_VERSION}-3.el${RHEL_MAJOR}.noarch.rpm (rhel/rocky/alma/oracle)
+        local repo_base="https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/${REPO_DISTRO}/${RHEL_MAJOR}"
+        local rpm_url="${repo_base}/x86_64/zabbix-release-${ZABBIX_VERSION}-3.el${RHEL_MAJOR}.noarch.rpm"
+        rpm -Uvh "${rpm_url}" 2>/dev/null || true
         dnf clean all -q
     fi
 }
