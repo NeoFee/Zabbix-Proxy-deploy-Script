@@ -23,6 +23,13 @@ set -e
 
 # === Konfiguration ===
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || true
+# #region agent log
+DEBUG_LOG="${SCRIPT_DIR:-.}/debug-4b4a29.log"
+dbg() { echo "{\"sessionId\":\"4b4a29\",\"location\":\"$1\",\"message\":\"$2\",\"data\":$3,\"timestamp\":$(date +%s)000,\"hypothesisId\":\"$4\"}" >> "${DEBUG_LOG}" 2>/dev/null || true; }
+# #endregion
+# Debug-Log im tmp-Ordner (jede Zeile wird geschrieben, keine Passwörter/PSK)
+DEBUG_LOG_TMP="/tmp/zabbix-proxy-install-debug.log"
+debug_tmp() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${DEBUG_LOG_TMP}" 2>/dev/null || true; }
 # Fester Log-Pfad, damit Logs immer auffindbar sind (unabhängig von Aufrufpfad/sudo)
 LOG_DIR="/var/log/zabbix-proxy-install"
 LOG_FILE=""
@@ -208,6 +215,19 @@ ask_db_credentials() {
     log "PostgreSQL User: ${DB_USER}"
 }
 
+# Prüft PSK-Key: mindestens 32 Zeichen, nur Hexadezimal (0-9, a-f, A-F)
+validate_psk_key() {
+    if [[ ${#1} -lt 32 ]]; then
+        echo "  Ungültig: Key muss mindestens 32 Zeichen haben (aktuell: ${#1})."
+        return 1
+    fi
+    if [[ ! "$1" =~ ^[0-9a-fA-F]+$ ]]; then
+        echo "  Ungültig: Key darf nur Hexadezimalzeichen enthalten (0-9, a-f, A-F)."
+        return 1
+    fi
+    return 0
+}
+
 ask_psk() {
     echo ""
     read -rp "PSK-Verschlüsselung verwenden? (j/n) [n]: " USE_PSK
@@ -220,8 +240,13 @@ ask_psk() {
             PSK_KEY=$(openssl rand -hex 32)
             echo "  Generierter PSK-Key (bitte notieren): ${PSK_KEY}"
         else
-            read -rsp "  PSK-Key (Hex, 32-512 Zeichen): " PSK_KEY
-            echo ""
+            while true; do
+                read -rsp "  PSK-Key (Hex, mind. 32 Zeichen, nur 0-9/a-f/A-F): " PSK_KEY
+                echo ""
+                if validate_psk_key "${PSK_KEY}"; then
+                    break
+                fi
+            done
         fi
         read -rp "  PSK Identity: " PSK_IDENTITY
         while [[ -z "${PSK_IDENTITY}" ]]; do
@@ -350,30 +375,36 @@ import_schema() {
     log "Schema importiert"
 }
 
-# === Config-Parameter setzen (sed-safe, Injection-sicher) ===
-# Escaped für sed mit # als Delimiter: \ & / # ; Zeilenumbrüche werden entfernt
-escape_config_value() {
-    printf '%s' "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/&/\\&/g; s/#/\\#/g; s/\//\\\//g'
-}
-
+# === Config-Parameter setzen (sonderzeichen-sicher ohne sed-Ersetzungsprobleme) ===
+# Wert wird über Temp-Datei an awk übergeben, damit $ # " \ usw. nie die Shell/sed treffen
 set_config_param() {
     local file="$1"
     local param="$2"
     local value="$3"
-    local escaped_value
-    escaped_value=$(escape_config_value "${value}")
+    debug_tmp "set_config_param ENTRY file=${file} param=${param} value_len=${#value}"
 
-    if grep -q "^${param}=" "${file}" 2>/dev/null; then
-        sed -i "s#^${param}=.*#${param}=${escaped_value}#" "${file}"
-    elif grep -q "^#${param}=" "${file}" 2>/dev/null; then
-        sed -i "s#^#${param}=.*#${param}=${escaped_value}#" "${file}"
+    local tmpval
+    tmpval=$(mktemp)
+    printf '%s' "${value}" | tr '\n' ' ' > "${tmpval}"
+    debug_tmp "set_config_param tmpval=${tmpval}"
+
+    if grep -q "^${param}=" "${file}" 2>/dev/null || grep -q "^# *${param}=" "${file}" 2>/dev/null; then
+        debug_tmp "set_config_param Ersetze Zeile in ${file} für ${param}= (awk)"
+        awk -v key="${param}" 'BEGIN{while((getline v < "'"${tmpval}"'")>0) val=val v; close("'"${tmpval}"'")}
+            $0 ~ "^" key "=" || $0 ~ "^# *" key "=" {print key "=" val; next}
+            {print}' "${file}" > "${file}.tmp" && mv "${file}.tmp" "${file}"
+        debug_tmp "set_config_param awk OK"
     else
+        debug_tmp "set_config_param Anhängen an ${file} für ${param}="
         echo "${param}=${value}" >> "${file}"
     fi
+    rm -f "${tmpval}"
+    debug_tmp "set_config_param EXIT"
 }
 
 # === Config-Datei anlegen falls vom Paket nicht mitgeliefert ===
 ensure_proxy_config() {
+    debug_tmp "ensure_proxy_config ${PROXY_CONF} exists=$(test -f \"${PROXY_CONF}\" && echo 1 || echo 0)"
     if [[ -f "${PROXY_CONF}" ]]; then
         [[ -f "${PROXY_CONF}.bak" ]] || cp "${PROXY_CONF}" "${PROXY_CONF}.bak"
         return
@@ -397,6 +428,7 @@ PROXYCONF
 }
 
 ensure_agent2_config() {
+    debug_tmp "ensure_agent2_config ${AGENT2_CONF} exists=$(test -f \"${AGENT2_CONF}\" && echo 1 || echo 0)"
     if [[ -f "${AGENT2_CONF}" ]]; then
         [[ -f "${AGENT2_CONF}.bak" ]] || cp "${AGENT2_CONF}" "${AGENT2_CONF}.bak"
         return
@@ -417,8 +449,10 @@ AGENT2CONF
 
 # === Proxy konfigurieren ===
 configure_proxy() {
+    debug_tmp "configure_proxy START"
     log "Konfiguriere Zabbix Proxy..."
     ensure_proxy_config
+    debug_tmp "configure_proxy ensure_proxy_config done, setze Parameter"
 
     set_config_param "${PROXY_CONF}" "Server" "${ZABBIX_SERVER}"
     set_config_param "${PROXY_CONF}" "Hostname" "${PROXY_HOSTNAME}"
@@ -434,6 +468,7 @@ configure_proxy() {
         set_config_param "${PROXY_CONF}" "TLSPSKIdentity" "${PSK_IDENTITY}"
         set_config_param "${PROXY_CONF}" "TLSPSKFile" "${PROXY_PSK}"
     fi
+    debug_tmp "configure_proxy EXIT"
 }
 
 # === Agent 2 konfigurieren ===
@@ -454,6 +489,73 @@ configure_agent2() {
         set_config_param "${AGENT2_CONF}" "TLSPSKIdentity" "${PSK_IDENTITY}"
         set_config_param "${AGENT2_CONF}" "TLSPSKFile" "${AGENT2_PSK}"
     fi
+}
+
+# === Installations-Menü ===
+ask_install_mode() {
+    echo ""
+    echo "Installations-Modus:"
+    echo "  1) Komplettinstallation (Proxy + Agent2 + DB + Config + Services)"
+    echo "  2) Nur Datenbank (PostgreSQL + User/DB + Schema, ohne Proxy/Agent-Config)"
+    echo "  3) Ab Schritt wiederholen (nach Fehler ab gewähltem Schritt fortsetzen)"
+    echo ""
+    read -rp "Auswahl (1-3): " choice
+    while [[ ! "${choice}" =~ ^[123]$ ]]; do
+        read -rp "Bitte 1, 2 oder 3 eingeben: " choice
+    done
+    case "${choice}" in
+        1) INSTALL_MODE="full" ;;
+        2) INSTALL_MODE="database_only" ;;
+        3) INSTALL_MODE="resume" ;;
+    esac
+    log "Modus: ${INSTALL_MODE}"
+}
+
+# Schritt-Menü für "Ab Schritt wiederholen" (Schritte 5-11)
+ask_resume_from_step() {
+    echo ""
+    echo "Ab welchem Schritt fortsetzen? (Schritte 1-4 werden zur Eingabe ausgeführt.)"
+    echo "  5) PostgreSQL installieren"
+    echo "  6) User/DB anlegen"
+    echo "  7) Zabbix Pakete installieren"
+    echo "  8) Schema importieren"
+    echo "  9) Proxy konfigurieren"
+    echo " 10) Agent2 konfigurieren"
+    echo " 11) Services starten"
+    echo ""
+    read -rp "Schritt (5-11): " RESUME_FROM
+    while [[ ! "${RESUME_FROM}" =~ ^(5|6|7|8|9|10|11)$ ]]; do
+        read -rp "Bitte eine Zahl von 5 bis 11 eingeben: " RESUME_FROM
+    done
+    log "Fortsetzung ab Schritt ${RESUME_FROM}"
+}
+
+# Schritte 1-4: Plattform, Deps, Repo, Abfragen
+run_steps_1_to_4() {
+    detect_platform
+    install_deps
+    ask_version
+    add_zabbix_repo
+    ask_zabbix_server
+    ask_hostname
+    ask_db_credentials
+    ask_psk
+}
+
+# Einzelnen Schritt N (5-11) ausführen
+run_step() {
+    debug_tmp "run_step $1"
+    case "$1" in
+        5) install_postgresql ;;
+        6) setup_postgresql_db ;;
+        7) install_zabbix ;;
+        8) import_schema ;;
+        9) configure_proxy ;;
+        10) configure_agent2 ;;
+        11) start_services ;;
+        *) log "Unbekannter Schritt: $1"; return 1 ;;
+    esac
+    debug_tmp "run_step $1 done"
 }
 
 # === Services aktivieren und starten (reboot-sicher) ===
@@ -483,47 +585,91 @@ start_services() {
 
 # === Hauptablauf ===
 main() {
+    # #region agent log
+    dbg "main:entry" "main started" "{\"EUID\":$EUID,\"LOG_DIR\":\"${LOG_DIR}\",\"SCRIPT_DIR\":\"${SCRIPT_DIR}\"}" "A"
+    # #endregion
     # Zuerst Privilegien prüfen (ggf. sudo), damit Log-Verzeichnis als root angelegt werden kann
     check_privileges "$@"
 
+    # #region agent log
+    dbg "main:after_check_priv" "after check_privileges" "{\"EUID\":$EUID}" "A"
+    # #endregion
     # Log-Pfad setzen und Verzeichnis anlegen (fester Pfad, reboot-persistent)
     LOG_FILE="${LOG_DIR}/install-zabbix-proxy_$(date +%Y%m%d_%H%M%S).log"
     mkdir -p "${LOG_DIR}"
+    # #region agent log
+    dbg "main:after_mkdir" "after mkdir" "{\"LOG_FILE\":\"${LOG_FILE}\",\"dir_exists\":$(test -d "${LOG_DIR}" && echo true || echo false)}" "B"
+    # #endregion
     if ! touch "${LOG_FILE}" 2>/dev/null; then
+        # #region agent log
+        dbg "main:fallback" "touch failed, using fallback" "{\"LOG_DIR\":\"${LOG_DIR}\"}" "B"
+        # #endregion
         LOG_DIR="/tmp/zabbix-proxy-install"
         mkdir -p "${LOG_DIR}"
         LOG_FILE="${LOG_DIR}/install-zabbix-proxy_$(date +%Y%m%d_%H%M%S).log"
         touch "${LOG_FILE}" || { echo "Fehler: Log-Datei konnte nicht angelegt werden."; exit 1; }
     fi
     # Erste Zeile direkt in Datei schreiben, damit die Datei garantiert existiert
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log gestartet: ${LOG_FILE}" >> "${LOG_FILE}"
+    # #region agent log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log gestartet: ${LOG_FILE}" >> "${LOG_FILE}" 2>/dev/null; rc=$?; dbg "main:first_write" "first echo to LOG_FILE" "{\"LOG_FILE\":\"${LOG_FILE}\",\"exit\":$rc}" "C"
+    # #endregion
     # Pfad auf Konsole ausgeben (vor exec), falls Terminal von tee getrennt ist
     echo "Log-Datei: ${LOG_FILE}" >&2
+    # #region agent log
+    dbg "main:before_exec" "about to exec tee" "{\"LOG_FILE\":\"${LOG_FILE}\",\"file_exists\":$(test -f "${LOG_FILE}" && echo true || echo false)}" "E"
+    # #endregion
     exec > >(tee -a "${LOG_FILE}") 2>&1
 
     log "=== Zabbix Proxy Installation gestartet ==="
     log "Log-Datei: ${LOG_FILE}"
-    detect_platform
-    install_deps
+    log "Debug-Log (tmp): ${DEBUG_LOG_TMP}"
+    debug_tmp "=== Debug-Log gestartet ==="
+    debug_tmp "DEBUG_LOG_TMP=${DEBUG_LOG_TMP}"
+    debug_tmp "LOG_FILE=${LOG_FILE}"
 
-    ask_version
-    add_zabbix_repo
+    ask_install_mode
+    # #region agent log
+    dbg "main:menu_selected" "install mode chosen" "{\"INSTALL_MODE\":\"${INSTALL_MODE}\",\"resume_from\":\"${RESUME_FROM:-}\"}" "A"
+    # #endregion
 
-    ask_zabbix_server
-    ask_hostname
-    ask_db_credentials
-    ask_psk
+    RESUME_FROM=""
+    if [[ "${INSTALL_MODE}" == "resume" ]]; then
+        ask_resume_from_step
+        # #region agent log
+        dbg "main:resume_from" "resume step chosen" "{\"RESUME_FROM\":${RESUME_FROM}}" "A"
+        # #endregion
+    fi
 
-    install_postgresql
-    setup_postgresql_db
-    install_zabbix
-    import_schema
-    configure_proxy
-    configure_agent2
-    start_services
+    run_steps_1_to_4
+
+    case "${INSTALL_MODE}" in
+        full)
+            for s in 5 6 7 8 9 10 11; do run_step "$s"; done
+            ;;
+        database_only)
+            for s in 5 6 7 8; do run_step "$s"; done
+            log "=== Nur Datenbank abgeschlossen ==="
+            log "Zum Konfigurieren von Proxy/Agent und Start der Services: Script erneut starten und Option 3 → ab Schritt 9 wählen."
+            sync
+            echo ""
+            echo "Nur Datenbank abgeschlossen. Komplettinstallation später mit Option 3 (Ab Schritt 9) möglich."
+            echo "Log: ${LOG_FILE}"
+            # #region agent log
+            dbg "main:end" "main finished (database_only)" "{\"LOG_FILE\":\"${LOG_FILE}\"}" "A"
+            # #endregion
+            exit 0
+            ;;
+        resume)
+            for ((s = RESUME_FROM; s <= 11; s++)); do run_step "$s"; done
+            ;;
+    esac
 
     log "=== Installation abgeschlossen ==="
     log "Log-Datei: ${LOG_FILE}"
+    sync
+    # #region agent log
+    dbg "main:end" "main finished" "{\"LOG_FILE\":\"${LOG_FILE}\"}" "A"
+    # #endregion
     echo ""
     echo "Installation erfolgreich! Log: ${LOG_FILE}"
 }
